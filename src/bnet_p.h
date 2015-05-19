@@ -7,89 +7,9 @@
 #define BNET_P_H_HEADER_GUARD
 
 #include "bnet.h"
+#include "bnet_socket.h"
 
-#ifndef BNET_CONFIG_DEBUG
-#	define BNET_CONFIG_DEBUG 0
-#endif // BNET_CONFIG_DEBUG
-
-extern void dbgPrintf(const char* _format, ...);
-extern void dbgPrintfData(const void* _data, uint32_t _size, const char* _format, ...);
-
-#if BNET_CONFIG_DEBUG
-#	define BX_TRACE(_format, ...) \
-				do { \
-					dbgPrintf(BX_FILE_LINE_LITERAL "BNET " _format "\n", ##__VA_ARGS__); \
-				} while(0)
-
-#	define BX_CHECK(_condition, _format, ...) \
-				do { \
-					if (!(_condition) ) \
-					{ \
-						BX_TRACE(BX_FILE_LINE_LITERAL _format, ##__VA_ARGS__); \
-						bx::debugBreak(); \
-					} \
-				} while(0)
-#endif // 0
-
-#include <bx/bx.h>
-
-#ifndef BNET_CONFIG_OPENSSL
-#	define BNET_CONFIG_OPENSSL 0 //(BX_PLATFORM_WINDOWS && BX_COMPILER_MSVC) || BX_PLATFORM_ANDROID || BX_PLATFORM_LINUX
-#endif // BNET_CONFIG_OPENSSL
-
-#ifndef BNET_CONFIG_DEBUG
-#	define BNET_CONFIG_DEBUG 0
-#endif // BNET_CONFIG_DEBUG
-
-#ifndef BNET_CONFIG_CONNECT_TIMEOUT_SECONDS
-#	define BNET_CONFIG_CONNECT_TIMEOUT_SECONDS 5
-#endif // BNET_CONFIG_CONNECT_TIMEOUT_SECONDS
-
-#ifndef BNET_CONFIG_MAX_INCOMING_BUFFER_SIZE
-#	define BNET_CONFIG_MAX_INCOMING_BUFFER_SIZE (64<<10)
-#endif // BNET_CONFIG_MAX_INCOMING_BUFFER_SIZE
-
-#if BX_PLATFORM_WINDOWS || BX_PLATFORM_XBOX360
-#	if BX_PLATFORM_WINDOWS
-#		if !defined(_WIN32_WINNT)
-#			define _WIN32_WINNT 0x0501
-#		endif
-#		include <ws2tcpip.h>
-#	elif BX_PLATFORM_XBOX360
-#		include <xtl.h>
-#	endif
-#	define socklen_t int32_t
-#	define EWOULDBLOCK WSAEWOULDBLOCK
-#	define EINPROGRESS WSAEINPROGRESS
-#	include "inet_socket.h"
-#elif BX_PLATFORM_LINUX || BX_PLATFORM_ANDROID || BX_PLATFORM_OSX || BX_PLATFORM_IOS
-#	include <memory.h>
-#	include <errno.h> // errno
-#	include <fcntl.h>
-#	include <netdb.h>
-#	include <unistd.h>
-#	include <sys/socket.h>
-#	include <sys/time.h> // gettimeofday
-#	include <arpa/inet.h> // inet_addr
-#	include <netinet/in.h>
-#	include <netinet/tcp.h>
-	typedef int SOCKET;
-	typedef linger LINGER;
-	typedef hostent HOSTENT;
-	typedef in_addr IN_ADDR;
-	
-#	define SOCKET_ERROR (-1)
-#	define INVALID_SOCKET (-1)
-#	define closesocket close
-#	include "inet_socket.h"
-#elif BX_PLATFORM_NACL
-#	include <errno.h> // errno
-#	include <string.h>
-#	include <sys/time.h> // gettimeofday
-#	include <sys/types.h> // fd_set
-#	include "nacl_socket.h"
-#endif // BX_PLATFORM_
-
+#include "config.h"
 #include <bx/debug.h>
 #include <bx/handlealloc.h>
 #include <bx/ringbuffer.h>
@@ -98,16 +18,6 @@ extern void dbgPrintfData(const void* _data, uint32_t _size, const char* _format
 
 #include <new> // placement new
 #include <stdio.h> // sscanf
-
-#if BNET_CONFIG_OPENSSL
-#	include <openssl/err.h>
-#	include <openssl/ssl.h>
-#	include <openssl/crypto.h>
-#else
-#	define SSL_CTX void
-#	define X509 void
-#	define EVP_PKEY void
-#endif // BNET_CONFIG_OPENSSL
 
 #include <list>
 
@@ -125,7 +35,7 @@ namespace bnet
 
 	extern bx::ReallocatorI* g_allocator;
 
-	Handle ctxAccept(Handle _listenHandle, SOCKET _socket, uint32_t _ip, uint16_t _port, bool _raw, X509* _cert, EVP_PKEY* _key);
+	Handle ctxAccept(Handle _listenHandle, bool _raw);
 	void ctxPush(Handle _handle, MessageId::Enum _id);
 	void ctxPush(Message* _msg);
 	Message* msgAlloc(Handle _handle, uint16_t _size, bool _incoming = false, Internal::Enum _type = Internal::None);
@@ -238,20 +148,17 @@ namespace bnet
 		{
 		}
 
-		int recv(SOCKET _socket)
+		SocketResult::Enum recv(Handle _handle, uint32_t* _bytes)
 		{
 			m_reserved += m_control.reserve(UINT32_MAX);
 			uint32_t end = (m_write + m_reserved) % m_control.m_size;
 			uint32_t wrap = end < m_write ? m_control.m_size - m_write : m_reserved;
 			char* to = &m_buffer[m_write];
 
-			int bytes = ::recv(_socket
-							  , to
-							  , wrap
-							  , 0
-							  );
+			uint32_t bytes;
+			SocketResult::Enum result = socketRecv(_handle, &bytes, to, wrap);
 
-			if (0 < bytes)
+			if (result == SocketResult::OK)
 			{
 				m_write += bytes;
 				m_write %= m_control.m_size;
@@ -259,33 +166,9 @@ namespace bnet
 				m_control.commit(bytes);
 			}
 
-			return bytes;
+			*_bytes = bytes;
+			return result;
 		}
-
-#if BNET_CONFIG_OPENSSL
-		int recv(SSL* _ssl)
-		{
-			m_reserved += m_control.reserve(-1);
-			uint32_t end = (m_write + m_reserved) % m_control.m_size;
-			uint32_t wrap = end < m_write ? m_control.m_size - m_write : m_reserved;
-			char* to = &m_buffer[m_write];
-
-			int bytes = SSL_read(_ssl
-								, to
-								, wrap
-								);
-
-			if (0 < bytes)
-			{
-				m_write += bytes;
-				m_write %= m_control.m_size;
-				m_reserved -= bytes;
-				m_control.commit(bytes);
-			}
-
-			return bytes;
-		}
-#endif // BNET_CONFIG_OPENSSL
 
 	private:
 		RecvRingBuffer();

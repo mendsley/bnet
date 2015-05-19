@@ -12,90 +12,17 @@ namespace bnet
 	static bx::CrtAllocator s_allocatorStub;
 	bx::ReallocatorI* g_allocator = &s_allocatorStub;
 
-#if BNET_CONFIG_OPENSSL && BNET_CONFIG_DEBUG
-
-	static void getSslErrorInfo()
-	{
-		BIO* bio = BIO_new(BIO_s_mem());
-		ERR_print_errors(bio);
-		BUF_MEM *bptr;
-		BIO_get_mem_ptr(bio, &bptr);
-		BX_TRACE("OpenSSL Error: %.*s", bptr->length, bptr->data);
-		BIO_free(bio);
-	}
-
-#	define TRACE_SSL_ERROR() getSslErrorInfo()
-#else
-#	define TRACE_SSL_ERROR()
-#endif // BNET_CONFIG_OPENSSL && BNET_CONFIG_DEBUG
-
-	int getLastError()
-	{
-#if BX_PLATFORM_WINDOWS || BX_PLATFORM_XBOX360
-		return WSAGetLastError();
-#elif BX_PLATFORM_LINUX || BX_PLATFORM_NACL || BX_PLATFORM_ANDROID || BX_PLATFORM_OSX || BX_PLATFORM_IOS
-		return errno;
-#else
-		return 0;
-#endif // BX_PLATFORM_
-	}
-
-#if BNET_CONFIG_OPENSSL
-#else
-	static int sslDummyContext;
-#endif
-
-	bool isInProgress()
-	{
-		return EINPROGRESS == getLastError();
-	}
-
-	bool isWouldBlock()
-	{
-		return EWOULDBLOCK == getLastError();
-	}
-
-	void setNonBlock(SOCKET _socket)
-	{
-#if BX_PLATFORM_WINDOWS || BX_PLATFORM_XBOX360
-		unsigned long opt = 1 ;
-		::ioctlsocket(_socket, FIONBIO, &opt);
-#elif BX_PLATFORM_LINUX || BX_PLATFORM_ANDROID || BX_PLATFORM_OSX || BX_PLATFORM_IOS
-		::fcntl(_socket, F_SETFL, O_NONBLOCK);
-#else
-		BX_UNUSED(_socket);
-#endif // BX_PLATFORM_
-	}
-
-	static void setSockOpts(SOCKET _socket)
-	{
-		int result;
-
-		int win = 256<<10;
-		result = ::setsockopt(_socket, SOL_SOCKET, SO_RCVBUF, (char*)&win, sizeof(win) );
-		result = ::setsockopt(_socket, SOL_SOCKET, SO_SNDBUF, (char*)&win, sizeof(win) );
-
-		int noDelay = 1;
-		result = ::setsockopt(_socket, IPPROTO_TCP, TCP_NODELAY, (char*)&noDelay, sizeof(noDelay) );
-		BX_UNUSED(result);
-	}
-
 	class Connection
 	{
 	public:
 		Connection()
-			: m_socket(INVALID_SOCKET)
-			, m_handle(invalidHandle)
+			: m_handle(invalidHandle)
 			, m_incomingBuffer( (uint8_t*)BX_ALLOC(g_allocator, BNET_CONFIG_MAX_INCOMING_BUFFER_SIZE) )
 			, m_incoming(BNET_CONFIG_MAX_INCOMING_BUFFER_SIZE)
 			, m_recv(m_incoming, (char*)m_incomingBuffer)
-#if BNET_CONFIG_OPENSSL
-			, m_ssl(NULL)
-#endif // BNET_CONFIG_OPENSSL
 			, m_len(-1)
 			, m_raw(false)
-			, m_tcpHandshake(true)
-			, m_sslHandshake(false)
+			, m_handshake(true)
 		{
 			BX_TRACE("ctor %d", m_handle);
 		}
@@ -106,94 +33,45 @@ namespace bnet
 			BX_FREE(g_allocator, m_incomingBuffer);
 		}
 
-		void connect(Handle _handle, uint32_t _ip, uint16_t _port, bool _raw, SSL_CTX* _sslCtx)
+		void connect(Handle _handle, uint32_t _ip, uint16_t _port, bool _raw, bool _secure)
 		{
 			init(_handle, _raw);
 
-			m_socket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-			if (INVALID_SOCKET == m_socket)
+			SocketResult::Enum result = socketConnect(_handle, _ip, _port, _secure);
+			if (result != SocketResult::OK)
 			{
 				ctxPush(m_handle, MessageId::ConnectFailed);
 				return;
 			}
-
-			setSockOpts(m_socket);
-			setNonBlock(m_socket);
-
-			const bool ssl = _sslCtx != NULL;
-			int err = connectsocket(m_socket, _ip, _port, ssl);
-
-			if (0 != err
-			&&  !(isInProgress() || isWouldBlock() ) )
-			{
-				::closesocket(m_socket);
-				m_socket = INVALID_SOCKET;
-
-				ctxPush(m_handle, MessageId::ConnectFailed);
-				return;
-			}
-
-#if BNET_CONFIG_OPENSSL
-			if (ssl)
-			{
-				m_sslHandshake = true;
-				m_ssl = SSL_new(_sslCtx);
-				SSL_set_fd(m_ssl, (int)m_socket);
-				SSL_set_connect_state(m_ssl);
-				SSL_write(m_ssl, NULL, 0);
-			}
-#else
-			BX_UNUSED(_sslCtx);
-#endif // BNET_CONFIG_OPENSSL
 		}
 
-		void accept(Handle _handle, Handle _listenHandle, SOCKET _socket, uint32_t _ip, uint16_t _port, bool _raw, SSL_CTX* _sslCtx, X509* _cert, EVP_PKEY* _key)
+		void accept(Handle _handle, Handle _listenHandle, bool _raw)
 		{
 			init(_handle, _raw);
-			
-			m_socket = _socket;
+
+			uint32_t ip;
+			uint16_t port;
+			SocketResult::Enum result = socketAccept(_listenHandle, _handle, &ip, &port);
+			if (result != SocketResult::OK)
+			{
+				BX_TRACE("Accept %d -> %d - Failed.", _listenHandle.idx, _handle.idx);
+				disconnect();
+				return;
+			}
+
 			Message* msg = msgAlloc(m_handle, 9, true);
 			msg->data[0] = MessageId::IncomingConnection;
 			*( (uint16_t*)&msg->data[1]) = _listenHandle.idx;
-			*( (uint32_t*)&msg->data[3]) = _ip;
-			*( (uint16_t*)&msg->data[7]) = _port;
+			*( (uint32_t*)&msg->data[3]) = ip;
+			*( (uint16_t*)&msg->data[7]) = port;
 			ctxPush(msg);
-
-#if BNET_CONFIG_OPENSSL
-			if (NULL != _sslCtx)
-			{
-				m_sslHandshake = true;
-				m_ssl = SSL_new(_sslCtx);
-				int result;
-				result = SSL_use_certificate(m_ssl, _cert);
-				result = SSL_use_PrivateKey(m_ssl, _key);
-				result = SSL_set_fd(m_ssl, (int)m_socket);
-				BX_UNUSED(result);
-				SSL_set_accept_state(m_ssl);
-				SSL_read(m_ssl, NULL, 0);
-			}
-#else
-			BX_UNUSED(_sslCtx);
-			BX_UNUSED(_cert);
-			BX_UNUSED(_key);
-#endif // BNET_CONFIG_OPENSSL
 		}
 
 		void disconnect(DisconnectReason::Enum _reason = DisconnectReason::None)
 		{
-#if BNET_CONFIG_OPENSSL
-			if (m_ssl)
+			if (hasSocket())
 			{
-				SSL_shutdown(m_ssl);
-				SSL_free(m_ssl); 
-				m_ssl = NULL;
-			}
-#endif // BNET_CONFIG_OPENSSL
-
-			if (INVALID_SOCKET != m_socket)
-			{
-				::closesocket(m_socket);
-				m_socket = INVALID_SOCKET;
+				socketClose(m_handle);
 			}
 
 			for (Message* msg = m_outgoing.pop(); NULL != msg; msg = m_outgoing.pop() )
@@ -213,7 +91,7 @@ namespace bnet
 		void send(Message* _msg)
 		{
 			BX_CHECK(m_raw || _msg->data[0] >= MessageId::UserDefined, "Sending message with MessageId below UserDefined is not allowed!");
-			if (INVALID_SOCKET != m_socket)
+			if (hasSocket())
 			{
 				m_outgoing.push(_msg);
 				update();
@@ -222,12 +100,11 @@ namespace bnet
 
 		void update()
 		{
-			if (INVALID_SOCKET != m_socket)
+			if (hasSocket())
 			{
 				updateSocket();
 
-				if (!m_tcpHandshake
-				&&  !m_sslHandshake)
+				if (!m_handshake)
 				{
 					updateIncomingMessages();
 				}
@@ -236,16 +113,15 @@ namespace bnet
 
 		bool hasSocket() const
 		{
-			return INVALID_SOCKET != m_socket;
+			return socketIsValid(m_handle);
 		}
 
 	private:
 		void init(Handle _handle, bool _raw)
 		{
 			m_handle = _handle;
-			m_tcpHandshake = true;
-			m_sslHandshake = false;
-			m_tcpHandshakeTimeout = bx::getHPCounter() + bx::getHPFrequency()*BNET_CONFIG_CONNECT_TIMEOUT_SECONDS;
+			m_handshake = true;
+			m_handshakeTimeout = bx::getHPCounter() + bx::getHPFrequency()*BNET_CONFIG_CONNECT_TIMEOUT_SECONDS;
 			m_len = -1;
 			m_raw = _raw;
 
@@ -344,91 +220,73 @@ namespace bnet
 
 		void updateSocket()
 		{
-			if (updateTcpHandshake()
-			&&  updateSslHandshake() )
+			if (updateHandshake())
 			{
-				int bytes;
+				uint32_t bytes;
+				SocketResult::Enum result = m_recv.recv(m_handle, &bytes);
 
-#if BNET_CONFIG_OPENSSL
-				if (NULL != m_ssl)
+				if (result == SocketResult::Failure)
 				{
-					bytes = m_recv.recv(m_ssl);
+					BX_TRACE("Disconnect %d - Receive failed", m_handle);
+					disconnect(DisconnectReason::RecvFailed);
+					return;
 				}
-				else
-#endif // BNET_CONFIG_OPENSSL
+				else if (result == SocketResult::OK && 0 == bytes)
 				{
-					bytes = m_recv.recv(m_socket);
-				}
-
-				if (1 > bytes)
-				{
-					if (0 == bytes)
-					{
-						BX_TRACE("Disconnect %d - Host closed connection.", m_handle);
-						disconnect(DisconnectReason::HostClosed);
-						return;
-					}
-					else if (!isWouldBlock() )
-					{
-						TRACE_SSL_ERROR();
-						BX_TRACE("Disconnect %d - Receive failed. %d", m_handle, getLastError() );
-						disconnect(DisconnectReason::RecvFailed);
-						return;
-					}
+					BX_TRACE("Disconnect %d - Host closed connection.", m_handle);
+					disconnect(DisconnectReason::HostClosed);
+					return;
 				}
 
-				if (!m_sslHandshake)
+				if (m_raw)
 				{
-					if (m_raw)
+					for (Message* msg = m_outgoing.peek(); NULL != msg; msg = m_outgoing.peek() )
 					{
-						for (Message* msg = m_outgoing.peek(); NULL != msg; msg = m_outgoing.peek() )
+						Internal::Enum id = Internal::Enum(*(msg->data - 2) );
+						if (Internal::None != id)
 						{
-							Internal::Enum id = Internal::Enum(*(msg->data - 2) );
-							if (Internal::None != id)
-							{
-								if (!processInternal(id, msg) )
-								{
-									return;
-								}
-							}
-							else if (!send( (char*)msg->data, msg->size) )
+							if (!processInternalAndRelease(id, msg) )
 							{
 								return;
 							}
-
-							release(m_outgoing.pop() );
 						}
-					}
-					else
-					{
-						for (Message* msg = m_outgoing.peek(); NULL != msg; msg = m_outgoing.peek() )
+						else if (!sendAndRelease(msg, 0, msg->size))
 						{
-							Internal::Enum id = Internal::Enum(*(msg->data - 2) );
-							if (Internal::None != id)
+							return;
+						}
+
+						m_outgoing.pop();
+					}
+				}
+				else
+				{
+					for (Message* msg = m_outgoing.peek(); NULL != msg; msg = m_outgoing.peek() )
+					{
+						Internal::Enum id = Internal::Enum(*(msg->data - 2) );
+						if (Internal::None != id)
+						{
+							*( (uint16_t*)msg->data - 1) = msg->size;
+							if (!processInternalAndRelease(id, msg) )
 							{
-								*( (uint16_t*)msg->data - 1) = msg->size;
-								if (!processInternal(id, msg) )
-								{
-									return;
-								}
+								return;
 							}
+						}
 							else
 							{
 								*( (uint16_t*)msg->data - 1) = bx::toLittleEndian(msg->size);
-								if (!send( (char*)msg->data - 2, msg->size+2) )
+								if (!sendAndRelease(msg, -2, msg->size+2))
 								{
 									return;
 								}
-							}
-
-							release(m_outgoing.pop() );
 						}
+
+						m_outgoing.pop();
 					}
 				}
 			}
 		}
 
-		bool processInternal(Internal::Enum _id, Message* _msg)
+		bool processInternalAndRelease(Internal::Enum _id, Message* _msg)
 		{
 			switch (_id)
 			{
@@ -442,6 +300,7 @@ namespace bnet
 					BX_TRACE("Disconnect %d - Client closed connection (finish).", m_handle);
 					disconnect();
 				}
+				release(_msg);
 				return false;
 
 			case Internal::Notify:
@@ -451,6 +310,7 @@ namespace bnet
 					memcpy(&msg->data[1], _msg->data, _msg->size);
 					ctxPush(msg);
 				}
+				release(_msg);
 				return true;
 
 			default:
@@ -461,15 +321,15 @@ namespace bnet
 			return true;
 		}
 
-		bool updateTcpHandshake()
+		bool updateHandshake()
 		{
-			if (!m_tcpHandshake)
+			if (!m_handshake)
 			{
 				return true;
 			}
 
 			uint64_t now = bx::getHPCounter();
-			if (now > m_tcpHandshakeTimeout)
+			if (now > m_handshakeTimeout)
 			{
 				BX_TRACE("Disconnect %d - Connect timeout.", m_handle);
 				ctxPush(m_handle, MessageId::ConnectFailed);
@@ -477,132 +337,43 @@ namespace bnet
 				return false;
 			}
 
-			m_tcpHandshake = !issocketready(m_socket);
-			return !m_tcpHandshake;
-		}
-
-		bool updateSslHandshake()
-		{
-#if BNET_CONFIG_OPENSSL
-			if (NULL != m_ssl
-			&&  m_sslHandshake)
+			SocketResult::Enum result = socketHandshake(m_handle);
+			if (result == SocketResult::Failure)
 			{
-				int err = SSL_do_handshake(m_ssl);
-
-				if (1 == err)
-				{
-					m_sslHandshake = false;
-#	if BNET_CONFIG_DEBUG
-					X509* cert = SSL_get_peer_certificate(m_ssl);
-					BX_TRACE("Server certificate:");
-
-					char* temp;
-					temp = X509_NAME_oneline(X509_get_subject_name(cert), 0, 0);
-					BX_TRACE("\t subject: %s", temp);
-					OPENSSL_free(temp);
-
-					temp = X509_NAME_oneline(X509_get_issuer_name(cert), 0, 0);
-					BX_TRACE("\t issuer: %s", temp);
-					OPENSSL_free(temp);
-
-					X509_free(cert);
-#	endif // BNET_CONFIG_DEBUG
-
-					long result = SSL_get_verify_result(m_ssl);
-					if (X509_V_OK != result)
-					{
-						BX_TRACE("Disconnect %d - SSL verify failed %d.", m_handle, result);
-						ctxPush(m_handle, MessageId::ConnectFailed);
-						disconnect();
-						return false;
-					}
-
-					BX_TRACE("SSL connection using %s", SSL_get_cipher(m_ssl) );
-				}
-				else
-				{
-					int sslError = SSL_get_error(m_ssl, err);
-					switch (sslError)
-					{
-					case SSL_ERROR_WANT_READ:
-						SSL_read(m_ssl, NULL, 0);
-						break;
-
-					case SSL_ERROR_WANT_WRITE:
-						SSL_write(m_ssl, NULL, 0);
-						break;
-
-					default:
-						TRACE_SSL_ERROR();
-						break;
-					}
-				}
+				BX_TRACE("Disconnect %d - Connect failed.", m_handle.idx);
+				ctxPush(m_handle, MessageId::ConnectFailed);
+				disconnect();
+				return false;
 			}
-#endif // BNET_CONFIG_OPENSSL
 
-			return true;
+
+			m_handshake = (result == SocketResult::WouldBlock);
+			return !m_handshake;
 		}
 
-		bool send(const char* _data, uint32_t _len)
+		bool sendAndRelease(bnet::Message* _msg, int32_t _offset, uint32_t _size)
 		{
-			int bytes;
-			uint32_t offset = 0;
-			do
+			SocketResult::Enum result = socketSendAndRelease(m_handle, _msg, _offset, _size);
+			if (result != SocketResult::OK)
 			{
-#if BNET_CONFIG_OPENSSL
-				if (NULL != m_ssl)
-				{
-					bytes = SSL_write(m_ssl
-						, &_data[offset]
-						, _len
-						);
-				}
-				else
-#endif // BNET_CONFIG_OPENSSL
-				{
-					bytes = ::send(m_socket
-						, &_data[offset]
-						, _len
-						, 0
-						);
-				}
-				
-				if (0 > bytes)
-				{
-					if (-1 == bytes
-					&&  !isWouldBlock() )
-					{
-						BX_TRACE("Disconnect %d - Send failed.", m_handle);
-						disconnect(DisconnectReason::SendFailed);
-						return false;
-					}
-				}
-				else
-				{
-					_len -= bytes;
-					offset += bytes;
-				}
-				
-			} while (0 < _len);
+				BX_TRACE("Disconnect %d - Send failed.", m_handle);
+				disconnect(DisconnectReason::SendFailed);
+				return false;
+			}
 
 			return true;
 		}
 
-		uint64_t m_tcpHandshakeTimeout;
-		SOCKET m_socket;
+		uint64_t m_handshakeTimeout;
 		Handle m_handle;
 		uint8_t* m_incomingBuffer;
 		bx::RingBufferControl m_incoming;
 		RecvRingBuffer m_recv;
 		MessageQueue m_outgoing;
-#if BNET_CONFIG_OPENSSL
-		SSL* m_ssl;
-#endif // BNET_CONFIG_OPENSSL
 
 		int m_len;
 		bool m_raw;
-		bool m_tcpHandshake;
-		bool m_sslHandshake;
+		bool m_handshake;
 	};
 
 	typedef FreeList<Connection> Connections;
@@ -611,12 +382,8 @@ namespace bnet
 	{
 	public:
 		ListenSocket()
-			: m_socket(INVALID_SOCKET)
-			, m_handle(invalidHandle)
+			: m_handle(invalidHandle)
 			, m_raw(false)
-			, m_secure(false)
-			, m_cert(NULL)
-			, m_key(NULL)
 		{
 		}
 
@@ -627,25 +394,7 @@ namespace bnet
 
 		void close()
 		{
-			if (INVALID_SOCKET != m_socket)
-			{
-				::closesocket(m_socket);
-				m_socket = INVALID_SOCKET;
-			}
-
-#if BNET_CONFIG_OPENSSL
-			if (NULL != m_cert)
-			{
-				X509_free(m_cert);
-				m_cert = NULL;
-			}
-
-			if (NULL != m_key)
-			{
-				EVP_PKEY_free(m_key);
-				m_key = NULL;
-			}
-#endif // BNET_CONFIG_OPENSSL
+			socketListenClose(m_handle);
 		}
 
 		void listen(Handle _handle, uint32_t _ip, uint16_t _port, bool _raw, const char* _cert, const char* _key)
@@ -653,84 +402,26 @@ namespace bnet
 			m_handle = _handle;
 			m_raw = _raw;
 
-#if BNET_CONFIG_OPENSSL
-			if (NULL != _cert)
+			SocketResult::Enum result = socketListen(_handle, _ip, _port, _cert, _key);
+			if (result == SocketResult::Failure)
 			{
-				BIO* mem = BIO_new_mem_buf(const_cast<char*>(_cert), -1);
-				m_cert = PEM_read_bio_X509(mem, NULL, NULL, NULL);
-				BIO_free(mem);
-			}
-
-			if (NULL != _key)
-			{
-				BIO* mem = BIO_new_mem_buf(const_cast<char*>(_key), -1);
-				m_key = PEM_read_bio_PrivateKey(mem, NULL, NULL, NULL);
-				BIO_free(mem);
-			}
-
-			m_secure = NULL != m_key && NULL != m_cert;
-#endif // BNET_CONFIG_OPENSSL
-
-			if (!m_secure
-			&&  (NULL != _cert || NULL != _key) )
-			{
-#if BNET_CONFIG_OPENSSL
-				BX_TRACE("Certificate of key is not set correctly.");
-#else
-				BX_TRACE("BNET_CONFIG_OPENSSL is not enabled.");
-#endif // BNET_CONFIG_OPENSSL
+				BX_TRACE("Listen socket failed.");
 				ctxPush(m_handle, MessageId::ListenFailed);
-				return;
 			}
-
-			m_socket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-			if (INVALID_SOCKET == m_socket)
-			{
-				BX_TRACE("Create socket failed.");
-				ctxPush(m_handle, MessageId::ListenFailed);
-				return;
-			}
-			setSockOpts(m_socket);
-
-			m_addr.sin_family = AF_INET;
-			m_addr.sin_addr.s_addr = htonl(_ip);
-			m_addr.sin_port = htons(_port);
-
-			if (SOCKET_ERROR == ::bind(m_socket, (sockaddr*)&m_addr, sizeof(m_addr) )
-			||  SOCKET_ERROR == ::listen(m_socket, SOMAXCONN) )
-			{
-				::closesocket(m_socket);
-				m_socket = INVALID_SOCKET;
-
-				BX_TRACE("Bind or listen socket failed.");
-				ctxPush(m_handle, MessageId::ListenFailed);
-				return;
-			}
-
-			setNonBlock(m_socket);
 		}
 
 		void update()
 		{
-			sockaddr_in addr;
-			socklen_t len = sizeof(addr);
-			SOCKET socket = ::accept(m_socket, (sockaddr*)&addr, &len);
-			if (INVALID_SOCKET != socket)
+			SocketResult::Enum result = socketListenHasPending(m_handle);
+			if (result == SocketResult::OK)
 			{
-				uint32_t ip = ntohl(addr.sin_addr.s_addr);
-				uint16_t port = ntohs(addr.sin_port);
-				ctxAccept(m_handle, socket, ip, port, m_raw, m_cert, m_key);
+				ctxAccept(m_handle, m_raw);
 			}
 		}
 
 	private:
-		sockaddr_in m_addr;
-		SOCKET m_socket;
 		Handle m_handle;
 		bool m_raw;
-		bool m_secure;
-		X509* m_cert;
-		EVP_PKEY* m_key;
 	};
 
 	typedef FreeList<ListenSocket> ListenSockets;
@@ -741,8 +432,6 @@ namespace bnet
 		Context()
 			: m_connections(NULL)
 			, m_listenSockets(NULL)
-			, m_sslCtx(NULL)
-			, m_sslCtxServer(NULL)
 		{
 		}
 
@@ -752,37 +441,7 @@ namespace bnet
 
 		void init(uint16_t _maxConnections, uint16_t _maxListenSockets, const char* _certs[])
 		{
-#if BNET_CONFIG_OPENSSL
-			CRYPTO_get_mem_functions(&m_sslMalloc, &m_sslRealloc, &m_sslFree);
-			CRYPTO_set_mem_functions(sslMalloc, sslRealloc, sslFree);
-			SSL_library_init();
-#	if BNET_CONFIG_DEBUG
-			SSL_load_error_strings();
-#	endif // BNET_CONFIG_DEBUG
-			m_sslCtx = SSL_CTX_new(SSLv23_client_method() );
-			SSL_CTX_set_verify(m_sslCtx, SSL_VERIFY_NONE, NULL);
-			if (NULL != _certs)
-			{
-				X509_STORE* store = SSL_CTX_get_cert_store(m_sslCtx);
-				for (const char** cert = _certs; NULL != *cert; ++cert )
-				{
-					BIO* mem = BIO_new_mem_buf(const_cast<char*>(*cert), -1);
-					X509* x509 = PEM_read_bio_X509(mem, NULL, NULL, NULL);
-					X509_STORE_add_cert(store, x509);
-					X509_free(x509);
-					BIO_free(mem);
-				}
-			}
-
-			if (_maxListenSockets)
-			{
-				m_sslCtxServer = SSL_CTX_new(SSLv23_server_method());
-			}
-#else
-			m_sslCtx = &sslDummyContext;
-			m_sslCtxServer = &sslDummyContext;
-			BX_UNUSED(_certs);
-#endif // BNET_CONFIG_OPENSSL
+			socketInit(_maxConnections, _maxListenSockets, _certs);
 
 			_maxConnections = _maxConnections == 0 ? 1 : _maxConnections;
 
@@ -808,20 +467,7 @@ namespace bnet
 				BX_DELETE(g_allocator, m_listenSockets);
 			}
 
-#if BNET_CONFIG_OPENSSL
-			if (NULL != m_sslCtx)
-			{
-				SSL_CTX_free(m_sslCtx);
-			}
-			m_sslCtx = NULL;
-
-			if (NULL != m_sslCtxServer)
-			{
-				SSL_CTX_free(m_sslCtxServer);
-			}
-			m_sslCtxServer = NULL;
-			CRYPTO_set_mem_functions(m_sslMalloc, m_sslRealloc, m_sslFree);
-#endif // BNET_CONFIG_OPENSSL
+			socketShutdown();
 		}
 
 		Handle listen(uint32_t _ip, uint16_t _port, bool _raw, const char* _cert, const char* _key)
@@ -844,14 +490,13 @@ namespace bnet
 			m_listenSockets->destroy(listenSocket);
 		}
 
-		Handle accept(Handle _listenHandle, SOCKET _socket, uint32_t _ip, uint16_t _port, bool _raw, X509* _cert, EVP_PKEY* _key)
+		Handle accept(Handle _listenHandle, bool _raw)
 		{
 			Connection* connection = m_connections->create();
 			if (NULL != connection)
 			{
 				Handle handle = { m_connections->getHandle(connection) };
-				bool secure = NULL != _cert && NULL != _key;
-				connection->accept(handle, _listenHandle, _socket, _ip, _port, _raw, secure?m_sslCtxServer:NULL, _cert, _key);
+				connection->accept(handle, _listenHandle, _raw);
 				return handle;
 			}
 
@@ -864,7 +509,7 @@ namespace bnet
 			if (NULL != connection)
 			{
 				Handle handle = { m_connections->getHandle(connection) };
-				connection->connect(handle, _ip, _port, _raw, _secure?m_sslCtx:NULL);
+				connection->connect(handle, _ip, _port, _raw, _secure);
 				return handle;
 			}
 
@@ -989,42 +634,13 @@ namespace bnet
 		ListenSockets* m_listenSockets;
 
 		MessageQueue m_incoming;
-
-#if BNET_CONFIG_OPENSSL
-		static void* sslMalloc(size_t _size)
-		{
-			return BX_ALLOC(g_allocator, _size);
-		}
-
-		static void* sslRealloc(void* _ptr, size_t _size)
-		{
-			return BX_REALLOC(g_allocator, _ptr, _size);
-		}
-
-		static void sslFree(void* _ptr)
-		{
-			return BX_FREE(g_allocator, _ptr);
-		}
-
-		typedef void* (*MallocFn)(size_t _size);
-		MallocFn m_sslMalloc;
-
-		typedef void* (*ReallocFn)(void* _ptr, size_t _size);
-		ReallocFn m_sslRealloc;
-
-		typedef void (*FreeFn)(void* _ptr);
-		FreeFn m_sslFree;
-#endif // BNET_CONFIG_OPENSSL
-
-		SSL_CTX* m_sslCtx;
-		SSL_CTX* m_sslCtxServer;
 	};
 
 	static Context s_ctx;
 	
-	Handle ctxAccept(Handle _listenHandle, SOCKET _socket, uint32_t _ip, uint16_t _port, bool _raw, X509* _cert, EVP_PKEY* _key)
+	Handle ctxAccept(Handle _listenHandle, bool _raw)
 	{
-		return s_ctx.accept(_listenHandle, _socket, _ip, _port, _raw, _cert, _key);
+		return s_ctx.accept(_listenHandle, _raw);
 	}
 
 	void ctxPush(Handle _handle, MessageId::Enum _id)
@@ -1138,41 +754,14 @@ namespace bnet
 			return (a0<<24) | (a1<<16) | (a2<<8) | a3;
 		}
 
-#if BX_PLATFORM_XBOX360 || BX_PLATFORM_NACL
-		// No DNS resolution on these platforms
+		uint32_t ip;
+		SocketResult::Enum result = socketResolveIPv4(_addr, &ip);
+		if (result == SocketResult::OK)
+		{
+			return ip;
+		}
+
 		return 0;
-#else
-		uint32_t ip = 0;
-		struct addrinfo* result = NULL;
-		struct addrinfo hints;
-		memset(&hints, 0, sizeof(hints) );
-		hints.ai_family = AF_UNSPEC;
-
-		int res = getaddrinfo(_addr, NULL, &hints, &result);
-
-		if (0 == res)
-		{
-			while (result)
-			{
-				sockaddr_in* addr = (sockaddr_in*)result->ai_addr;
-				if (AF_INET == result->ai_family
-				&&  INADDR_LOOPBACK != addr->sin_addr.s_addr)
-				{
-					ip = ntohl(addr->sin_addr.s_addr);
-					break;
-				}
-
-				result = result->ai_next;
-			}
-		}
-
-		if (NULL != result)
-		{
-			freeaddrinfo(result);
-		}
-
-		return ip;
-#endif // BX_PLATFORM_
 	}
 
 } // namespace bnet
