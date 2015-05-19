@@ -116,6 +116,21 @@ function exampleProject(_name, _uuid)
 end
 
 dofile "bnet.lua"
+	configuration { "x32", "vs*" }
+		includedirs { BNET_DIR .. "3rdparty/openssl/lib/win32_" .. _ACTION .. "/include" }
+
+	configuration { "x64", "vs*" }
+		includedirs { BNET_DIR .. "3rdparty/openssl/lib/win64_" .. _ACTION .. "/include" }
+
+	configuration { "android-arm7" }
+		includedirs { BNET_DIR .. "3rdparty/openssl/lib/android_arm7/include" }
+
+	configuration { "default-linux", "x32" }
+		includedirs { BNET_DIR .. "3rdparty/openssl/lib/linux-generic32/include" }
+
+	configuration { "default-linux", "x64" }
+		includedirs { BNET_DIR .. "3rdparty/openssl/lib/linux-generic64/include" }
+
 dofile "example-common.lua"
 exampleProject("00-chat", "1544c710-ad76-11e0-9f1c-0800200c9a66")
 exampleProject("01-http", "35161d20-ab2b-11e0-9f1c-0800200c9a66")
